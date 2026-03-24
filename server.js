@@ -436,6 +436,24 @@ io.on('connection', (socket) => {
         }
     });
 
+    socket.on('call-offer-v2', (data) => {
+        const targetSocket = onlineUsers.get(data.targetUid);
+        if (targetSocket) {
+            io.to(targetSocket).emit('call-offer-v2', { ...data, callerUid: socket.data.uid });
+        } else {
+            relaySignal('call-offer-v2', { ...data, callerUid: socket.data.uid });
+        }
+    });
+
+    socket.on('call-answer-v2', (data) => {
+        const targetSocket = onlineUsers.get(data.targetUid);
+        if (targetSocket) {
+            io.to(targetSocket).emit('call-answer-v2', data);
+        } else {
+            relaySignal('call-answer-v2', data);
+        }
+    });
+
     socket.on('call-end', (data) => {
         const targetSocket = onlineUsers.get(data.targetUid);
         if (targetSocket) {
@@ -454,20 +472,22 @@ io.on('connection', (socket) => {
     });
 });
 
-// ── Self-Pinging (Keep-Alive) ────────────────────────────────────────────────
-const SELF_SERVICE_URL = process.env.SELF_SERVICE_URL;
-if (SELF_SERVICE_URL) {
-    const PING_INTERVAL = 13 * 60 * 1000; // 13 minutes
-    setInterval(async () => {
+// ── Peer-to-Peer Keep-Alive (Mesh Pinging) ──────────────────────────────────
+// Automatically pings all peer nodes every 13 minutes to prevent sleeping.
+const PING_INTERVAL = 13 * 60 * 1000; // 13 minutes
+setInterval(async () => {
+    console.log(`[Keep-Alive] Starting Mesh Ping cycle...`);
+    const promises = PEER_NODES.map(async (nodeUrl) => {
         try {
-            await axios.get(SELF_SERVICE_URL);
-            console.log(`[Keep-Alive] Self-ping successful: ${SELF_SERVICE_URL}`);
+            await axios.get(`${nodeUrl}/ping`);
+            console.log(`[Keep-Alive] Ping successful: ${nodeUrl}`);
         } catch (err) {
-            console.warn(`[Keep-Alive] Self-ping failed: ${err.message}`);
+            console.warn(`[Keep-Alive] Ping failed for ${nodeUrl}: ${err.message}`);
         }
-    }, PING_INTERVAL);
-    console.log(`[Keep-Alive] Self-pinging ${SELF_SERVICE_URL} every 13 minutes`);
-}
+    });
+    await Promise.all(promises);
+}, PING_INTERVAL);
+console.log(`[Keep-Alive] Automated Mesh Pinging active for ${PEER_NODES.length} peers.`);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
