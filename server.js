@@ -348,6 +348,58 @@ app.post('/upload/telegram', upload.single('file'), async (req, res) => {
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, region: REGION }));
 
+// ── Socket.io Signaling ──────────────────────────────────────────────────────
+const { Server } = require('socket.io');
+const io = new Server(server, {
+    cors: { origin: "*", methods: ["GET", "POST"] },
+    transports: ['websocket', 'polling']
+});
+
+const onlineUsers = new Map();
+
+io.on('connection', (socket) => {
+    socket.on('user-online', (uid) => {
+        if (!uid) return;
+        onlineUsers.set(uid, socket.id);
+        socket.data.uid = uid;
+        socket.join(`user:${uid}`);
+        socket.broadcast.emit('user-status', { uid, online: true });
+    });
+
+    socket.on('join-room', (roomId) => {
+        socket.join(roomId);
+        socket.to(roomId).emit('user-joined', { socketId: socket.id });
+    });
+
+    socket.on('call-offer', (data) => {
+        const targetSocket = onlineUsers.get(data.targetUid);
+        if (targetSocket) io.to(targetSocket).emit('call-offer', { ...data, callerUid: socket.data.uid });
+    });
+
+    socket.on('call-answer', (data) => {
+        const targetSocket = onlineUsers.get(data.targetUid);
+        if (targetSocket) io.to(targetSocket).emit('call-answer', data);
+    });
+
+    socket.on('ice-candidate', (data) => {
+        const targetSocket = onlineUsers.get(data.targetUid);
+        if (targetSocket) io.to(targetSocket).emit('ice-candidate', data);
+    });
+
+    socket.on('call-end', (data) => {
+        const targetSocket = onlineUsers.get(data.targetUid);
+        if (targetSocket) io.to(targetSocket).emit('call-end', data);
+    });
+
+    socket.on('disconnect', () => {
+        const uid = socket.data.uid;
+        if (uid) {
+            onlineUsers.delete(uid);
+            socket.broadcast.emit('user-status', { uid, online: false });
+        }
+    });
+});
+
 // ── Self-Pinging (Keep-Alive) ────────────────────────────────────────────────
 const SELF_SERVICE_URL = process.env.SELF_SERVICE_URL;
 if (SELF_SERVICE_URL) {
@@ -365,4 +417,4 @@ if (SELF_SERVICE_URL) {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Z-CDN-Node [${REGION}] running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Z-CDN-Node [${REGION}] with Signaling running on port ${PORT}`));
