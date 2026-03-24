@@ -75,6 +75,14 @@ transporter.verify((error) => {
 // ── Region label (set via Render env var REGION, e.g. "singapore") ─────────────
 const REGION = process.env.REGION || 'unknown';
 
+// ── Peer Nodes for Signaling Relay ───────────────────────────────────────────
+const PEER_NODES = [
+    'https://z-chateueast.duckdns.org',
+    'https://zchatcentral.duckdns.org',
+    'https://z-chat-asia.duckdns.org',
+    'https://zchatohio.duckdns.org'
+].filter(url => !url.includes(process.env.SELF_DOMAIN || 'localhost')); // Don't relay to self
+
 // ── Root – simple response for uptime monitors ─────────────────────────────
 app.get('/', (req, res) => {
     res.status(200).send(`Z-CDN-Node [${REGION}] is Active`);
@@ -347,14 +355,45 @@ app.post('/upload/telegram', upload.single('file'), async (req, res) => {
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, region: REGION }));
 
-// ── Socket.io Signaling & Group Calls ─────────────────────────────────────────
+const onlineUsers = new Map();
+
+// Relay a signal to other nodes if user is not found locally
+async function relaySignal(event, data, excludeNode = null) {
+    // Prevent infinite loops by flagging relayed messages
+    if (data._relayed) return;
+    
+    const relayData = { ...data, _relayed: true };
+    const promises = PEER_NODES.map(async (nodeUrl) => {
+        if (nodeUrl === excludeNode) return;
+        try {
+            await axios.post(`${nodeUrl}/api/relay/signal`, { event, data: relayData }, { timeout: 2000 });
+        } catch (err) {
+            // Silently fail if peer node is down
+        }
+    });
+    await Promise.all(promises);
+}
+
+// Specialized endpoint for cross-node signaling
+app.post('/api/relay/signal', (req, res) => {
+    const { event, data } = req.body;
+    if (!event || !data || !data.targetUid) return res.status(400).send('Invalid relay data');
+
+    const targetSocket = onlineUsers.get(data.targetUid);
+    if (targetSocket) {
+        io.to(targetSocket).emit(event, data);
+        console.log(`[Relay] Delivered ${event} to ${data.targetUid} on this node`);
+    }
+    
+    res.sendStatus(200);
+});
+
+// ── Socket.io Signaling ──────────────────────────────────────────────────────
 const { Server } = require('socket.io');
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
     transports: ['websocket', 'polling']
 });
-
-const onlineUsers = new Map();
 
 io.on('connection', (socket) => {
     socket.on('user-online', (uid) => {
@@ -365,65 +404,44 @@ io.on('connection', (socket) => {
         socket.broadcast.emit('user-status', { uid, online: true });
     });
 
-    // Room logic for Group Calls
     socket.on('join-room', (roomId) => {
         socket.join(roomId);
-        // Inform others in the room that a new user joined
-        socket.to(roomId).emit('user-joined', { 
-            socketId: socket.id, 
-            uid: socket.data.uid 
-        });
+        socket.to(roomId).emit('user-joined', { socketId: socket.id });
     });
 
-    socket.on('leave-room', (roomId) => {
-        socket.leave(roomId);
-        socket.to(roomId).emit('user-left', { 
-            socketId: socket.id, 
-            uid: socket.data.uid 
-        });
-    });
-
-    // Signaling Relay (Supports both 1v1 and Group Calls)
     socket.on('call-offer', (data) => {
-        // data should contain targetUid and the SDP offer
         const targetSocket = onlineUsers.get(data.targetUid);
         if (targetSocket) {
-            io.to(targetSocket).emit('call-offer', { 
-                ...data, 
-                callerUid: socket.data.uid,
-                callerSocketId: socket.id
-            });
+            io.to(targetSocket).emit('call-offer', { ...data, callerUid: socket.data.uid });
+        } else {
+            relaySignal('call-offer', { ...data, callerUid: socket.data.uid });
         }
     });
 
     socket.on('call-answer', (data) => {
         const targetSocket = onlineUsers.get(data.targetUid);
         if (targetSocket) {
-            io.to(targetSocket).emit('call-answer', {
-                ...data,
-                responderUid: socket.data.uid
-            });
+            io.to(targetSocket).emit('call-answer', data);
+        } else {
+            relaySignal('call-answer', data);
         }
     });
 
     socket.on('ice-candidate', (data) => {
         const targetSocket = onlineUsers.get(data.targetUid);
         if (targetSocket) {
-            io.to(targetSocket).emit('ice-candidate', {
-                ...data,
-                senderUid: socket.data.uid
-            });
+            io.to(targetSocket).emit('ice-candidate', data);
+        } else {
+            relaySignal('ice-candidate', data);
         }
     });
 
     socket.on('call-end', (data) => {
-        if (data.roomId) {
-            // Group call end (for this user)
-            socket.to(data.roomId).emit('call-end', { uid: socket.data.uid });
-        } else if (data.targetUid) {
-            // 1v1 call end
-            const targetSocket = onlineUsers.get(data.targetUid);
-            if (targetSocket) io.to(targetSocket).emit('call-end', { uid: socket.data.uid });
+        const targetSocket = onlineUsers.get(data.targetUid);
+        if (targetSocket) {
+            io.to(targetSocket).emit('call-end', data);
+        } else {
+            relaySignal('call-end', data);
         }
     });
 
