@@ -348,6 +348,21 @@ app.post('/upload/telegram', upload.single('file'), async (req, res) => {
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, region: REGION }));
 
+// ── Self-Pinging (Keep-Alive) ────────────────────────────────────────────────
+const SELF_SERVICE_URL = process.env.SELF_SERVICE_URL;
+if (SELF_SERVICE_URL) {
+    const PING_INTERVAL = 13 * 60 * 1000; // 13 minutes
+    setInterval(async () => {
+        try {
+            await axios.get(SELF_SERVICE_URL);
+            console.log(`[Keep-Alive] Self-ping successful: ${SELF_SERVICE_URL}`);
+        } catch (err) {
+            console.warn(`[Keep-Alive] Self-ping failed: ${err.message}`);
+        }
+    }, PING_INTERVAL);
+    console.log(`[Keep-Alive] Self-pinging ${SELF_SERVICE_URL} every 13 minutes`);
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`Z-CDN-Node [${REGION}] running on port ${PORT}`));
