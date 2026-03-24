@@ -11,6 +11,7 @@ const nodemailer = require('nodemailer');
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
 
 const app = express();
+const server = http.createServer(app);
 app.use(compression()); // Reduces bandwidth usage
 
 // Force IPv4 for all axios requests to prevent ECONNRESET with Telegram
@@ -22,8 +23,6 @@ let adminDb = null;
 let fcmMessaging = null;
 
 try {
-    const admin = require('firebase-admin');
-
     // Use FIREBASE_SERVICE_ACCOUNT env var (JSON string)
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -348,7 +347,7 @@ app.post('/upload/telegram', upload.single('file'), async (req, res) => {
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, region: REGION }));
 
-// ── Socket.io Signaling ──────────────────────────────────────────────────────
+// ── Socket.io Signaling & Group Calls ─────────────────────────────────────────
 const { Server } = require('socket.io');
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
@@ -366,29 +365,66 @@ io.on('connection', (socket) => {
         socket.broadcast.emit('user-status', { uid, online: true });
     });
 
+    // Room logic for Group Calls
     socket.on('join-room', (roomId) => {
         socket.join(roomId);
-        socket.to(roomId).emit('user-joined', { socketId: socket.id });
+        // Inform others in the room that a new user joined
+        socket.to(roomId).emit('user-joined', { 
+            socketId: socket.id, 
+            uid: socket.data.uid 
+        });
     });
 
+    socket.on('leave-room', (roomId) => {
+        socket.leave(roomId);
+        socket.to(roomId).emit('user-left', { 
+            socketId: socket.id, 
+            uid: socket.data.uid 
+        });
+    });
+
+    // Signaling Relay (Supports both 1v1 and Group Calls)
     socket.on('call-offer', (data) => {
+        // data should contain targetUid and the SDP offer
         const targetSocket = onlineUsers.get(data.targetUid);
-        if (targetSocket) io.to(targetSocket).emit('call-offer', { ...data, callerUid: socket.data.uid });
+        if (targetSocket) {
+            io.to(targetSocket).emit('call-offer', { 
+                ...data, 
+                callerUid: socket.data.uid,
+                callerSocketId: socket.id
+            });
+        }
     });
 
     socket.on('call-answer', (data) => {
         const targetSocket = onlineUsers.get(data.targetUid);
-        if (targetSocket) io.to(targetSocket).emit('call-answer', data);
+        if (targetSocket) {
+            io.to(targetSocket).emit('call-answer', {
+                ...data,
+                responderUid: socket.data.uid
+            });
+        }
     });
 
     socket.on('ice-candidate', (data) => {
         const targetSocket = onlineUsers.get(data.targetUid);
-        if (targetSocket) io.to(targetSocket).emit('ice-candidate', data);
+        if (targetSocket) {
+            io.to(targetSocket).emit('ice-candidate', {
+                ...data,
+                senderUid: socket.data.uid
+            });
+        }
     });
 
     socket.on('call-end', (data) => {
-        const targetSocket = onlineUsers.get(data.targetUid);
-        if (targetSocket) io.to(targetSocket).emit('call-end', data);
+        if (data.roomId) {
+            // Group call end (for this user)
+            socket.to(data.roomId).emit('call-end', { uid: socket.data.uid });
+        } else if (data.targetUid) {
+            // 1v1 call end
+            const targetSocket = onlineUsers.get(data.targetUid);
+            if (targetSocket) io.to(targetSocket).emit('call-end', { uid: socket.data.uid });
+        }
     });
 
     socket.on('disconnect', () => {
