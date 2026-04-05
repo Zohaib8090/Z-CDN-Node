@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -8,11 +8,24 @@ const https = require('https');
 const TelegramBot = require('node-telegram-bot-api');
 const admin = require('firebase-admin');
 const nodemailer = require('nodemailer');
+const rateLimit = require('express-rate-limit');
+const { authenticator } = require('otplib');
+const QRCode = require('qrcode');
+const fs = require('fs');
+const path = require('path');
+
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
 
 const app = express();
-const server = http.createServer(app);
+const distPath = path.join(__dirname, '../dist');
+app.use(express.static(distPath));
 app.use(compression()); // Reduces bandwidth usage
+
+const server = http.createServer(app);
+const io = require('socket.io')(server, {
+    cors: { origin: '*', methods: ['GET', 'POST'] },
+    transports: ['websocket', 'polling']
+});
 
 // Force IPv4 for all axios requests to prevent ECONNRESET with Telegram
 axios.defaults.httpsAgent = new https.Agent({ family: 4 });
@@ -23,18 +36,55 @@ let adminDb = null;
 let fcmMessaging = null;
 
 try {
-    // Use FIREBASE_SERVICE_ACCOUNT env var (JSON string)
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount),
-            projectId: 'z-chat-144'
-        });
-        adminDb = admin.firestore();
-        fcmMessaging = admin.messaging();
-        console.log('[FCM] Firebase Admin initialised');
+    let credential;
+
+    // Prioritize local file if it exists (requested for private repo)
+    if (fs.existsSync(path.resolve(__dirname, 'serviceAccountKey.json'))) {
+        const serviceAccount = require('./serviceAccountKey.json');
+        credential = admin.credential.cert(serviceAccount);
+        console.log('[FCM] Using local serviceAccountKey.json');
+    } 
+    // Fallback to environment variable
+    else if (process.env.FIREBASE_SERVICE_ACCOUNT && process.env.FIREBASE_SERVICE_ACCOUNT !== 'PASTE_SINGLE_LINE_JSON_HERE') {
+        try {
+            // Production: use env var (JSON string)
+            let rawData = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+            
+            // Auto-fix common escaping issues before parsing
+            if (rawData.startsWith("'") && rawData.endsWith("'")) rawData = rawData.slice(1, -1);
+            if (rawData.startsWith('"') && rawData.endsWith('"')) rawData = rawData.slice(1, -1);
+
+            const serviceAccount = JSON.parse(rawData);
+            
+            // Fix double-escaped newlines in private key if they exist
+            if (serviceAccount.private_key && typeof serviceAccount.private_key === 'string') {
+                serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+            }
+
+            credential = admin.credential.cert(serviceAccount);
+        } catch (parseError) {
+            console.error('[FCM] CRITICAL: FIREBASE_SERVICE_ACCOUNT is set but contains INVALID JSON:', parseError.message);
+            console.error('[FCM] Ensure you are pasting the entire content of serviceAccountKey.json as a single line.');
+        }
+    }
+
+    if (credential) {
+        try {
+            admin.initializeApp({
+                credential,
+                projectId: 'z-chat-144',
+                databaseURL: process.env.DATABASE_URL || "https://z-chat-144-default-rtdb.asia-southeast1.firebasedatabase.app"
+            });
+            adminDb = admin.firestore();
+            fcmMessaging = admin.messaging();
+            console.log('[FCM] Firebase Admin initialised successfully');
+        } catch (initError) {
+            console.error('[FCM] CRITICAL: Firebase app initialization failed:', initError.message);
+        }
     } else {
-        console.warn('[FCM] FIREBASE_SERVICE_ACCOUNT not found — push notifications disabled');
+        console.warn('[FCM] No Firebase credentials found — 2FA and push notifications disabled.');
+        console.warn('  → Local key missing at:', path.resolve(__dirname, 'serviceAccountKey.json'));
+        console.warn('  → Env var FIREBASE_SERVICE_ACCOUNT is:', process.env.FIREBASE_SERVICE_ACCOUNT ? 'SET (but possibly failed parse)' : 'NOT SET');
     }
 } catch (e) {
     console.warn('[FCM] firebase-admin failed to load:', e.message);
@@ -83,9 +133,14 @@ const PEER_NODES = [
     'https://zchatohio.duckdns.org'
 ].filter(url => !url.includes(process.env.SELF_DOMAIN || 'localhost')); // Don't relay to self
 
-// ── Root – simple response for uptime monitors ─────────────────────────────
+// ── Root – serve the React app UI ───────────────────────────────────────────
 app.get('/', (req, res) => {
-    res.status(200).send(`Z-CDN-Node [${REGION}] is Active`);
+    const indexPath = path.join(distPath, 'index.html');
+    if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+    } else {
+        res.status(200).send(`Z-CDN-Node [${REGION}] is Active (UI not built)`);
+    }
 });
 
 // ── Ping – latency probe used by the CDN router in Z Chat ────────────────────
@@ -93,26 +148,68 @@ app.get('/ping', (req, res) => {
     res.json({ status: 'ok', region: REGION, timestamp: Date.now() });
 });
 
+// ── Rate Limiting ─────────────────────────────────────────────────────────────
+const twoFaLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute window
+    max: 4, // Limit each IP to 4 requests per windowMs
+    message: { error: 'Too many OTP requests from this IP, please try again after a minute' },
+    standardHeaders: true, 
+    legacyHeaders: false,
+});
+
 // ── 2FA Endpoints ─────────────────────────────────────────────────────────────
-app.post('/auth/2fa/send-code', async (req, res) => {
-    const { email, uid } = req.body;
+app.post('/auth/2fa/send-code', twoFaLimiter, async (req, res) => {
+    const { email, uid, resend = false } = req.body;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     
     if (!adminDb) return res.status(503).json({ error: 'Firebase Admin not initialized on server. Check FIREBASE_SERVICE_ACCOUNT variable.' });
     if (!email || !uid) return res.status(400).json({ error: 'Email and UID are required' });
 
     try {
-        // Generate 6-digit code
-        const code = Math.floor(100000 + Math.random() * 900000).toString();
-        const expiresAt = new Date(Date.now() + 10 * 60000); // 10 minutes from now
+        const docRef = adminDb.collection('twoFactorCodes').doc(uid);
+        const docSnap = await docRef.get();
+        let code;
+        let expiresAt;
+        let isNew = false;
 
-        // Save to Firestore
-        await adminDb.collection('twoFactorCodes').doc(uid).set({
-            code,
-            expiresAt: admin.firestore.Timestamp.fromDate(expiresAt),
-            email
-        });
+        // Reuse existing code if it's still valid (within its 10-minute expiry)
+        if (docSnap.exists) {
+            const data = docSnap.data();
+            const now = admin.firestore.Timestamp.now();
+            
+            if (data.expiresAt.toMillis() > now.toMillis()) {
+                code = data.code;
+                expiresAt = data.expiresAt.toDate();
+                console.log(`[2FA] Reusing existing code for ${email} (IP: ${ip})`);
+            }
+        }
 
-        // Send Email
+        // Generate new code only if none exists or it has expired
+        if (!code) {
+            code = Math.floor(100000 + Math.random() * 900000).toString();
+            expiresAt = new Date(Date.now() + 10 * 60000); // 10 minutes from now
+            isNew = true;
+
+            // Save to Firestore
+            await docRef.set({
+                code,
+                expiresAt: admin.firestore.Timestamp.fromDate(expiresAt),
+                email,
+                ip: ip || 'unknown'
+            });
+            console.log(`[2FA] Generated NEW code for ${email} (IP: ${ip})`);
+        } else {
+            // Update IP on resend if it changed
+            await docRef.update({ ip: ip || 'unknown' });
+        }
+
+        // SILENT SUCCESS: If code is reused and NOT a manual resend, skip the email
+        if (!isNew && !resend) {
+            console.log(`[2FA] Silent success for ${email} (No email sent on reload)`);
+            return res.json({ success: true, reused: true, silent: true });
+        }
+
+        // Send Email (New code OR manual resend)
         const mailOptions = {
             from: `"Z Chat Security" <${process.env.SMTP_USER}>`,
             to: email,
@@ -131,13 +228,69 @@ app.post('/auth/2fa/send-code', async (req, res) => {
         };
 
         await transporter.sendMail(mailOptions);
-        console.log(`[2FA] Code sent to ${email}`);
-        res.json({ success: true });
+        console.log(`[2FA] Email sent to ${email} (${isNew ? 'New' : 'Manual Resend'})`);
+        res.json({ success: true, reused: !isNew });
     } catch (err) {
         console.error('[2FA] Send error:', err);
         res.status(500).json({ error: 'Failed to send verification code' });
     }
 });
+
+// ── TOTP (Authenticator) Setup ──────────────────────────────────────────────
+app.post('/auth/2fa/totp/setup', async (req, res) => {
+    const { email, uid } = req.body;
+    if (!adminDb) return res.status(503).json({ error: 'Firebase Admin not initialized on server. Check FIREBASE_SERVICE_ACCOUNT variable.' });
+    if (!uid || !email) return res.status(400).json({ error: 'UID and email are required' });
+
+    try {
+        const secret = authenticator.generateSecret();
+        const otpauth = authenticator.keyuri(email, 'Z Chat', secret);
+        const qrCodeUrl = await QRCode.toDataURL(otpauth);
+
+        // Temporarily store secret (unconfirmed)
+        await adminDb.collection('tempTotpSecrets').doc(uid).set({
+            secret,
+            createdAt: admin.firestore.Timestamp.now()
+        });
+
+        res.json({ secret, qrCodeUrl });
+    } catch (err) {
+        console.error('[TOTP] Setup error:', err);
+        res.status(500).json({ error: 'Failed to generate TOTP secret' });
+    }
+});
+
+app.post('/auth/2fa/totp/enable', async (req, res) => {
+    const { uid, code } = req.body;
+    if (!adminDb) return res.status(503).json({ error: 'Firebase Admin not initialized on server. Check FIREBASE_SERVICE_ACCOUNT variable.' });
+    if (!uid || !code) return res.status(400).json({ error: 'UID and code are required' });
+
+    try {
+        const tempSnap = await adminDb.collection('tempTotpSecrets').doc(uid).get();
+        if (!tempSnap.exists) return res.status(404).json({ error: 'Setup session expired. Try again.' });
+
+        const { secret } = tempSnap.data();
+        const isValid = authenticator.check(code, secret);
+
+        if (!isValid) return res.status(400).json({ error: 'Invalid authenticator code' });
+
+        // Enable TOTP for user
+        await adminDb.collection('users').doc(uid).update({
+            twoFactorEnabled: true,
+            twoFactorType: 'authenticator',
+            totpSecret: secret
+        });
+
+        // Clean up temp secret
+        await adminDb.collection('tempTotpSecrets').doc(uid).delete();
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[TOTP] Enable error:', err);
+        res.status(500).json({ error: 'Failed to enable TOTP' });
+    }
+});
+
 
 app.post('/auth/2fa/verify-code', async (req, res) => {
     const { uid, code } = req.body;
@@ -154,17 +307,40 @@ app.post('/auth/2fa/verify-code', async (req, res) => {
         const data = docSnap.data();
         const now = admin.firestore.Timestamp.now();
 
-        if (data.code !== code) {
-            return res.status(400).json({ error: 'Invalid verification code' });
+        // 1. Check if user has TOTP enabled
+        const userDoc = await adminDb.collection('users').doc(uid).get();
+        const userData = userDoc.data();
+
+        let totpValid = false;
+        if (userData?.totpSecret) {
+            totpValid = authenticator.check(code, userData.totpSecret);
+            if (totpValid) {
+                console.log(`[2FA] Authenticator code verified for ${uid}`);
+                res.json({ success: true });
+                return;
+            }
         }
 
-        if (now.toMillis() > data.expiresAt.toMillis()) {
-            return res.status(400).json({ error: 'Verification code expired' });
+        // 2. Check Email Code as Backup
+        if (docSnap.exists) {
+            const emailData = docSnap.data();
+            const now = admin.firestore.Timestamp.now();
+
+            if (emailData.code === code) {
+                if (now.toMillis() > emailData.expiresAt.toMillis()) {
+                    return res.status(400).json({ error: 'Verification code expired' });
+                }
+                
+                console.log(`[2FA] Email code verified for ${uid}`);
+                // Success - clean up the code
+                await docRef.delete();
+                res.json({ success: true });
+                return;
+            }
         }
 
-        // Success - clean up the code
-        await docRef.delete();
-        res.json({ success: true });
+        // If we get here, neither matched
+        return res.status(400).json({ error: 'Invalid verification code' });
     } catch (err) {
         console.error('[2FA] Verify error:', err);
         res.status(500).json({ error: 'Verification failed' });
@@ -388,13 +564,6 @@ app.post('/api/relay/signal', (req, res) => {
     res.sendStatus(200);
 });
 
-// ── Socket.io Signaling ──────────────────────────────────────────────────────
-const { Server } = require('socket.io');
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] },
-    transports: ['websocket', 'polling']
-});
-
 io.on('connection', (socket) => {
     socket.on('user-online', (uid) => {
         if (!uid) return;
@@ -436,24 +605,6 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('call-offer-v2', (data) => {
-        const targetSocket = onlineUsers.get(data.targetUid);
-        if (targetSocket) {
-            io.to(targetSocket).emit('call-offer-v2', { ...data, callerUid: socket.data.uid });
-        } else {
-            relaySignal('call-offer-v2', { ...data, callerUid: socket.data.uid });
-        }
-    });
-
-    socket.on('call-answer-v2', (data) => {
-        const targetSocket = onlineUsers.get(data.targetUid);
-        if (targetSocket) {
-            io.to(targetSocket).emit('call-answer-v2', data);
-        } else {
-            relaySignal('call-answer-v2', data);
-        }
-    });
-
     socket.on('call-end', (data) => {
         const targetSocket = onlineUsers.get(data.targetUid);
         if (targetSocket) {
@@ -488,6 +639,16 @@ setInterval(async () => {
     await Promise.all(promises);
 }, PING_INTERVAL);
 console.log(`[Keep-Alive] Automated Mesh Pinging active for ${PEER_NODES.length} peers.`);
+
+// Catch-all route for Single Page Application
+app.get('*', (req, res) => {
+    const indexPath = path.join(distPath, 'index.html');
+    if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+    } else {
+        res.status(404).send('Not Found');
+    }
+});
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
