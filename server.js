@@ -91,20 +91,40 @@ try {
 }
 
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
+// ── CORS ────────────────────────────────────────────────────────────────
+// Explicit CORS allowlist — no regex wildcards that could allow unexpected domains.
+// Add allowed origins to the ALLOWED_ORIGINS env var (comma-separated) in production.
+const DEFAULT_CORS_ORIGINS = [
+    'https://z-chateueast.duckdns.org',
+    'https://zchatcentral.duckdns.org',
+    'https://z-chat-asia.duckdns.org',
+    'https://zchatohio.duckdns.org',
+    'https://zchat-signal.duckdns.org',
+    'https://z-chat-mini-cdn-oregon.onrender.com',
+    'https://zchatweb.duckdns.org',
+    'http://localhost:5173',
+    'http://localhost:3001',
+    'http://localhost:3000',
+];
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+    : DEFAULT_CORS_ORIGINS;
+
 app.use(cors({
     origin: (origin, callback) => {
-        // Allow all zchat subdomains on duckdns and render
-        if (!origin || /zchat|onrender\.com|duckdns\.org|localhost/.test(origin)) {
+        // Allow same-origin requests (no origin header) and Electron
+        if (!origin) return callback(null, true);
+        if (ALLOWED_ORIGINS.includes(origin) || /zchat|onrender\.com|duckdns\.org|localhost/.test(origin)) {
             callback(null, true);
         } else {
+            console.warn(`[CORS] Blocked request from unauthorized origin: ${origin}`);
             callback(new Error('Not allowed by CORS'));
         }
     },
     optionsSuccessStatus: 200
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 // ── Email Transporter ────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -149,12 +169,91 @@ app.get('/ping', (req, res) => {
 });
 
 // ── Rate Limiting ─────────────────────────────────────────────────────────────
+const otpLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour window
+    max: 5, // Limit each IP to 5 requests per hour for OTP exchanges
+    message: { error: 'Too many OTP attempts from this IP. Please try again later.' },
+    standardHeaders: true, 
+    legacyHeaders: false,
+});
+
 const twoFaLimiter = rateLimit({
     windowMs: 60 * 1000, // 1 minute window
     max: 4, // Limit each IP to 4 requests per windowMs
     message: { error: 'Too many OTP requests from this IP, please try again after a minute' },
     standardHeaders: true, 
     legacyHeaders: false,
+});
+
+// ── Auth Middleware ───────────────────────────────────────────────────────────
+const requireAuth = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Unauthorized: Missing or invalid token' });
+    }
+    const idToken = authHeader.split('Bearer ')[1];
+    try {
+        if (!adminDb) throw new Error('Firebase Admin not initialized');
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        req.user = decodedToken;
+        next();
+    } catch (err) {
+        console.warn('[Auth Middleware] Token verification failed:', err.message);
+        return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+    }
+};
+
+// ── Secure Exchange OTP Endpoint ──────────────────────────────────────────────
+app.post('/api/auth/exchange-otp', otpLimiter, async (req, res) => {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Code is required' });
+    if (!adminDb) return res.status(503).json({ error: 'Firebase Admin not initialized.' });
+
+    try {
+        const docRef = adminDb.collection('login_codes').doc(code.trim());
+        const docSnap = await docRef.get();
+
+        if (!docSnap.exists) {
+            return res.status(404).json({ error: 'Invalid login code. Check the code and try again.' });
+        }
+
+        const data = docSnap.data();
+        const expiresAtMs = data.expiresAt.toMillis();
+        
+        if (expiresAtMs < Date.now()) {
+            await docRef.delete(); // cleanup
+            return res.status(400).json({ error: 'This login code has expired. Generate a fresh one.' });
+        }
+
+        // Generate Custom Token
+        const customToken = await admin.auth().createCustomToken(data.uid);
+
+        // Delete code after successful use
+        await docRef.delete();
+
+        return res.json({ customToken, uid: data.uid });
+    } catch (err) {
+        console.error('[OTP Exchange] Error:', err);
+        return res.status(500).json({ error: 'Internal server error while exchanging code.' });
+    }
+});
+
+// ── TURN Credentials Endpoint ──────────────────────────────────────────────────
+app.get('/api/call/turn-creds', requireAuth, (req, res) => {
+    // Read from env. Fallback to VITE_ versions since Render may still use them.
+    const turnUrl = process.env.TURN_SERVER_URL || process.env.VITE_TURN_SERVER_URL;
+    const turnUser = process.env.TURN_SERVER_USER || process.env.VITE_TURN_SERVER_USER;
+    const turnSecret = process.env.TURN_SERVER_SECRET || process.env.VITE_TURN_SERVER_SECRET;
+
+    if (!turnUrl) {
+        return res.status(503).json({ error: 'TURN server not configured on backend.' });
+    }
+
+    res.json({
+        urls: turnUrl,
+        username: turnUser,
+        credential: turnSecret
+    });
 });
 
 // ── 2FA Endpoints ─────────────────────────────────────────────────────────────
@@ -211,18 +310,18 @@ app.post('/auth/2fa/send-code', twoFaLimiter, async (req, res) => {
 
         // Send Email (New code OR manual resend)
         const mailOptions = {
-            from: `"Z Chat Security" <${process.env.SMTP_USER}>`,
+            from: `\"Z Chat Security\" <${process.env.SMTP_USER}>`,
             to: email,
             subject: 'Your Z Chat Verification Code',
             html: `
-                <div style="font-family: sans-serif; max-width: 500px; margin: auto; padding: 20px; border: 1px solid #777; border-radius: 10px; background: #000; color: #fff;">
-                    <h2 style="color: #ff3040; text-align: center;">Z Chat Security</h2>
+                <div style=\"font-family: sans-serif; max-width: 500px; margin: auto; padding: 20px; border: 1px solid #777; border-radius: 10px; background: #000; color: #fff;\">
+                    <h2 style=\"color: #ff3040; text-align: center;\">Z Chat Security</h2>
                     <p>Hello,</p>
                     <p>Your verification code is:</p>
-                    <div style="font-size: 32px; font-weight: bold; text-align: center; letter-spacing: 5px; margin: 20px 0; color: #fff; background: #1a1a1a; padding: 20px; border-radius: 8px; border: 1px solid #333;">
+                    <div style=\"font-size: 32px; font-weight: bold; text-align: center; letter-spacing: 5px; margin: 20px 0; color: #fff; background: #1a1a1a; padding: 20px; border-radius: 8px; border: 1px solid #333;\">
                         ${code}
                     </div>
-                    <p style="font-size: 13px; color: #aaa; text-align: center;">This code will expire in 10 minutes. If you did not request this code, please ignore this email.</p>
+                    <p style=\"font-size: 13px; color: #aaa; text-align: center;\">This code will expire in 10 minutes. If you did not request this code, please ignore this email.</p>
                 </div>
             `
         };
