@@ -104,6 +104,7 @@ try {
 // ── CORS ────────────────────────────────────────────────────────────────
 // Explicit CORS allowlist — no regex wildcards that could allow unexpected domains.
 // Add allowed origins to the ALLOWED_ORIGINS env var (comma-separated) in production.
+const DEFAULT_CORS_ORIGINS = [
     'https://zchatweb.duckdns.org',
     'https://z-chateueast.duckdns.org',
     'https://zchatcentral.duckdns.org',
