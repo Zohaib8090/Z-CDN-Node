@@ -141,8 +141,9 @@ const PEER_NODES = [
     'https://z-chateueast.duckdns.org',
     'https://zchatcentral.duckdns.org',
     'https://z-chat-asia.duckdns.org',
-    'https://zchatohio.duckdns.org'
-].filter(url => !url.includes(process.env.SELF_DOMAIN || 'localhost'));
+    'https://zchatohio.duckdns.org',
+    'https://your-node-name.onrender.com'
+].filter(url => !url.includes(process.env.SELF_DOMAIN || 'localhost') && !url.includes('your-node-name'));
 
 // ── Rate Limiting ─────────────────────────────────────────────────────────────
 const authLimiter = rateLimit({
@@ -203,7 +204,7 @@ app.post('/auth/2fa/send-code', twoFaLimiter, async (req, res) => {
             subject: 'Your Z Chat Verification Code',
             html: `<div style="font-family: sans-serif; max-width: 500px; margin: auto; padding: 20px; border: 1px solid #777; border-radius: 10px; background: #000; color: #fff;">
                     <h2 style="color: #ff3040; text-align: center;">Z Chat Security</h2>
-                    <p>Your verification code is: <b>${code}</b></p>
+                    <p>Your verification code is: <b style="font-size: 24px;">${code}</b></p>
                     <p style="font-size: 13px; color: #aaa;">Expires in 5 minutes.</p>
                 </div>`
         };
@@ -294,7 +295,7 @@ app.post('/auth/verify-login-code', authLimiter, async (req, res) => {
     }
 });
 
-// ── Media Upload ──────────────────────────────────────────────────────────────
+// ── Media Upload & Storage ───────────────────────────────────────────────────
 const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp', 'image/svg+xml', 'image/heic', 'image/heif', 'video/mp4', 'video/webm', 'video/ogg', 'video/quicktime', 'video/x-msvideo', 'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/webm', 'audio/aac', 'audio/mp4', 'application/pdf']);
 const upload = multer({
     storage: multer.memoryStorage(),
@@ -311,7 +312,6 @@ app.post('/upload/telegram', upload.single('file'), async (req, res) => {
         const result = await bot.sendDocument(process.env.TELEGRAM_CHAT_ID, req.file.buffer, { contentType: req.file.mimetype, filename: req.file.originalname });
         const fileId = result.document ? result.document.file_id : (result.photo ? result.photo[result.photo.length - 1].file_id : null);
         
-        // Async Backup
         const userUid = req.body.userUid || req.query.userUid;
         if (userUid) backupFileToCloud(userUid, req.file.buffer, req.file.originalname, req.file.mimetype).catch(e => console.error('[Backup] Failed:', e.message));
 
@@ -321,35 +321,117 @@ app.post('/upload/telegram', upload.single('file'), async (req, res) => {
     }
 });
 
-// ── OAuth Routes ─────────────────────────────────────────────────────────────
-// (Simplified for safety, assuming existing logic works if corrected)
+// ── Cloud Backup Helpers ──────────────────────────────────────────────────────
+async function backupFileToCloud(userUid, buffer, filename, mimetype) {
+    if (!adminDb) return;
+    const userSnap = await adminDb.collection('users').doc(userUid).get();
+    if (!userSnap.exists) return;
+    const { backupSettings } = userSnap.data();
+    if (!backupSettings) return;
+
+    const isImage = mimetype.startsWith('image/');
+    const isVideo = mimetype.startsWith('video/');
+    const isOther = !isImage && !isVideo;
+
+    // Google Drive
+    if (backupSettings.google?.connected && backupSettings.google?.enabled !== false) {
+        const canBackup = (isImage && backupSettings.google.backupImages) || (isVideo && backupSettings.google.backupVideos) || (isOther && backupSettings.google.backupOthers);
+        if (canBackup) uploadToGoogleDrive(userUid, backupSettings.google, buffer, filename, mimetype).catch(e => console.error('[Backup] GDrive Error:', e.message));
+    }
+
+    // OneDrive
+    if (backupSettings.onedrive?.connected && backupSettings.onedrive?.enabled !== false) {
+        const canBackup = (isImage && backupSettings.onedrive.backupImages) || (isVideo && backupSettings.onedrive.backupVideos) || (isOther && backupSettings.onedrive.backupOthers);
+        if (canBackup) uploadToOneDrive(userUid, backupSettings.onedrive, buffer, filename, mimetype).catch(e => console.error('[Backup] OneDrive Error:', e.message));
+    }
+}
+
+async function uploadToGoogleDrive(userUid, googleSettings, buffer, filename, mimetype) {
+    let accessToken = await refreshGoogleToken(userUid, googleSettings.refreshToken);
+    const metadata = { name: `ZChat_${Date.now()}_${filename}`, parents: googleSettings.folderId ? [googleSettings.folderId] : [] };
+    const boundary = '-------314159265358979323846';
+    const delimiter = "\r\n--" + boundary + "\r\n";
+    const close_delim = "\r\n--" + boundary + "--";
+    const multipartBody = delimiter + 'Content-Type: application/json; charset=UTF-8\r\n\r\n' + JSON.stringify(metadata) + delimiter + 'Content-Type: ' + mimetype + '\r\n\r\n' + buffer.toString('base64') + close_delim;
+
+    await axios.post('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', Buffer.from(multipartBody, 'utf8'), {
+        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': `multipart/related; boundary=${boundary}`, 'Content-Transfer-Encoding': 'base64' }
+    });
+}
+
+async function uploadToOneDrive(userUid, onedriveSettings, buffer, filename, mimetype) {
+    let accessToken = await refreshOneDriveToken(userUid, onedriveSettings.refreshToken);
+    const sanitizedName = `ZChat_${Date.now()}_${filename.replace(/[^a-zA-Z0-9.]/g, '_')}`;
+    await axios.put(`https://graph.microsoft.com/v1.0/me/drive/root:/ZChat_Media/${sanitizedName}:/content`, buffer, {
+        headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': mimetype }
+    });
+}
+
+async function refreshGoogleToken(userUid, refreshToken) {
+    const res = await axios.post('https://oauth2.googleapis.com/token', {
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token'
+    });
+    return res.data.access_token;
+}
+
+async function refreshOneDriveToken(userUid, refreshToken) {
+    const res = await axios.post('https://login.microsoftonline.com/common/oauth2/v2.0/token', new URLSearchParams({
+        client_id: process.env.MS_CLIENT_ID,
+        client_secret: process.env.MS_CLIENT_SECRET,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token',
+        scope: 'Files.ReadWrite offline_access'
+    }));
+    return res.data.access_token;
+}
+
+// ── OAuth Initialization ─────────────────────────────────────────────────────
 app.get('/auth/google/init', (req, res) => {
     const url = `https://accounts.google.com/o/oauth2/v2/auth?` + new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID, redirect_uri: `${process.env.CDN_URL}/auth/google/callback`, response_type: 'code', scope: 'https://www.googleapis.com/auth/drive.file', access_type: 'offline', prompt: 'consent', state: req.query.uid }).toString();
     res.redirect(url);
 });
 
-async function backupFileToCloud(userUid, buffer, filename, mimetype) {
-    if (!adminDb) return;
-    const userSnap = await adminDb.collection('users').doc(userUid).get();
-    const { backupSettings } = userSnap.data() || {};
-    if (!backupSettings) return;
-    if (backupSettings.google?.connected && backupSettings.google?.enabled !== false) {
-        // ... (existing uploadToGoogleDrive logic)
-    }
-}
+app.get('/auth/google/callback', async (req, res) => {
+    const { code, state: uid } = req.query;
+    try {
+        const tr = await axios.post('https://oauth2.googleapis.com/token', { code, client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET, redirect_uri: `${process.env.CDN_URL}/auth/google/callback`, grant_type: 'authorization_code' });
+        await adminDb.collection('users').doc(uid).update({ 'backupSettings.google': { connected: true, refreshToken: tr.data.refresh_token, backupImages: true, backupVideos: true, backupOthers: true } });
+        res.send('<html><body><script>window.close();</script>Google Drive linked!</body></html>');
+    } catch (e) { res.status(500).send('Auth Error'); }
+});
 
-// ── Basic Routes ─────────────────────────────────────────────────────────────
+app.get('/auth/onedrive/init', (req, res) => {
+    const url = `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?` + new URLSearchParams({ client_id: process.env.MS_CLIENT_ID, redirect_uri: `${process.env.CDN_URL}/auth/onedrive/callback`, response_type: 'code', scope: 'Files.ReadWrite offline_access', state: req.query.uid }).toString();
+    res.redirect(url);
+});
+
+app.get('/auth/onedrive/callback', async (req, res) => {
+    const { code, state: uid } = req.query;
+    try {
+        const tr = await axios.post('https://login.microsoftonline.com/common/oauth2/v2.0/token', new URLSearchParams({ code, client_id: process.env.MS_CLIENT_ID, client_secret: process.env.MS_CLIENT_SECRET, redirect_uri: `${process.env.CDN_URL}/auth/onedrive/callback`, grant_type: 'authorization_code' }));
+        await adminDb.collection('users').doc(uid).update({ 'backupSettings.onedrive': { connected: true, refreshToken: tr.data.refresh_token, backupImages: true, backupVideos: true, backupOthers: true } });
+        res.send('<html><body><script>window.close();</script>OneDrive linked!</body></html>');
+    } catch (e) { res.status(500).send('Auth Error'); }
+});
+
+// ── Signaling & Health ────────────────────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', region: REGION, timestamp: Date.now() }));
 app.get('/health', (req, res) => res.json({ ok: true, region: REGION }));
 
-app.get('/', (req, res) => {
-    const indexPath = path.join(__dirname, '../dist', 'index.html');
-    if (fs.existsSync(indexPath)) res.sendFile(indexPath);
-    else res.status(200).send(`Z-CDN-Node [${REGION}] is Active and Secure`);
-});
-
-// ── Socket Routing & Signaling ──────────────────────────────────────────────
 const onlineUsers = new Map();
+async function relaySignal(event, data, excludeNode = null) {
+    if (data._relayed) return;
+    const relayData = { ...data, _relayed: true };
+    const promises = PEER_NODES.map(async nodeUrl => {
+        if (nodeUrl === excludeNode) return;
+        try { await axios.post(`${nodeUrl}/api/relay/signal`, { event, data: relayData }, { timeout: 2000 }); } catch (err) {}
+    });
+    await Promise.all(promises);
+}
+
 app.post('/api/relay/signal', (req, res) => {
     const { event, data } = req.body;
     const targetSocket = onlineUsers.get(data?.targetUid);
@@ -359,8 +441,25 @@ app.post('/api/relay/signal', (req, res) => {
 
 io.on('connection', (socket) => {
     socket.on('user-online', (uid) => { if (uid) { onlineUsers.set(uid, socket.id); socket.data.uid = uid; socket.join(`user:${uid}`); socket.broadcast.emit('user-status', { uid, online: true }); } });
+    socket.on('join-room', (roomId) => { socket.join(roomId); socket.to(roomId).emit('user-joined', { socketId: socket.id }); });
+    socket.on('call-offer', (data) => { const ts = onlineUsers.get(data.targetUid); if (ts) io.to(ts).emit('call-offer', { ...data, callerUid: socket.data.uid }); else relaySignal('call-offer', { ...data, callerUid: socket.data.uid }); });
+    socket.on('call-answer', (data) => { const ts = onlineUsers.get(data.targetUid); if (ts) io.to(ts).emit('call-answer', data); else relaySignal('call-answer', data); });
+    socket.on('ice-candidate', (data) => { const ts = onlineUsers.get(data.targetUid); if (ts) io.to(ts).emit('ice-candidate', data); else relaySignal('ice-candidate', data); });
+    socket.on('call-end', (data) => { const ts = onlineUsers.get(data.targetUid); if (ts) io.to(ts).emit('call-end', data); else relaySignal('call-end', data); });
     socket.on('disconnect', () => { const uid = socket.data.uid; if (uid) { onlineUsers.delete(uid); socket.broadcast.emit('user-status', { uid, online: false }); } });
-    // ... (rest of signal forwarding logic)
+});
+
+setInterval(async () => {
+    const promises = PEER_NODES.map(async url => { try { await axios.get(`${url}/ping`); } catch (err) {} });
+    await Promise.all(promises);
+}, 13 * 60 * 1000);
+
+app.get('*', (req, res) => {
+    const ext = path.extname(req.url);
+    if (ext && ext !== '.html') return res.status(404).send('Not Found');
+    const indexPath = path.join(__dirname, '../dist', 'index.html');
+    if (fs.existsSync(indexPath)) res.sendFile(indexPath);
+    else res.status(200).send(`Z-CDN-Node [${REGION}] Active`);
 });
 
 const PORT = process.env.PORT || 3001;
